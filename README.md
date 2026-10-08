@@ -11,8 +11,8 @@ Valorant, TFT, jogos da Steam/Epic etc.), sem API específica por jogo.
 ## Como funciona
 
 ```
-Discord (presence) ──► discord_presence.py ──► main.py (GameTracker) ──► db.py (SQLite)
-                         debounce de 15s              │
+Discord (presence) ──► discord_presence.py ──► main.py (GameTracker) ──► db.py (SQLite) ──► supabase_sync.py ──► Supabase
+                         debounce de 15s              │                                     (background, opcional)
                                                       └─► fila ──► igdb_client.py ──► telegram_bot.py
 ```
 
@@ -122,7 +122,30 @@ python igdb_client.py "Hollow Knight"
 
 Sem essas variáveis o bot funciona normalmente, só sem o enriquecimento.
 
-## 5. Rodar
+## 5. Supabase (opcional, para ter os dados na nuvem)
+
+O SQLite local continua sendo a fonte da verdade: `/stats` e `/nowplaying` leem dele,
+e o bot funciona normalmente sem internet ou sem Supabase. Um worker em background
+envia ao Supabase as sessões novas/alteradas (logo após início/fim de sessão e a cada
+30s). Se o envio falhar, as linhas ficam pendentes e vão na próxima tentativa
+(com espera crescente até 5 min). Sessões gravadas antes de configurar o Supabase
+também são enviadas.
+
+1. Crie um projeto em <https://supabase.com/dashboard>.
+2. Abra **SQL Editor > New query**, cole o conteúdo de [`supabase/schema.sql`](supabase/schema.sql)
+   e clique em **Run**. Isso cria a tabela `game_sessions` com RLS ligado e sem
+   policies (só a chave secreta acessa).
+3. Em **Project Settings > API** (ou **API Keys**), copie:
+   - **Project URL** → `SUPABASE_URL`
+   - a chave **secret** (`sb_secret_...`) ou a legada **service_role** → `SUPABASE_KEY`
+
+   Não use a chave publishable/anon: com RLS ligado ela não consegue gravar.
+   A chave secreta ignora RLS, então mantenha-a só no `.env`.
+
+Enquanto você joga, a linha da sessão aberta tem `ended_at = null` e `last_seen_at`
+atualizado a cada ~1 min, então dá para montar um "jogando agora" em cima do Supabase.
+
+## 6. Rodar
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -160,7 +183,9 @@ python main.py
 | `discord_presence.py` | Client do Discord, filtro por `ActivityType.playing`, debounce, detecção de início/fim |
 | `igdb_client.py`      | Busca na IGDB com token Twitch em cache (renova sozinho) e cache de resultados |
 | `telegram_bot.py`     | Comandos e formatação/envio das mensagens |
-| `db.py`               | SQLite: tabela `sessions` e queries de estatística |
+| `db.py`               | SQLite: tabela `sessions`, queries de estatística e controle do que falta sincronizar |
+| `supabase_sync.py`    | Envia as sessões pendentes ao Supabase (upsert via REST), com novas tentativas |
+| `supabase/schema.sql` | Tabela `game_sessions` para rodar no SQL Editor do Supabase |
 | `config.py`           | Leitura do `.env` e configuração de logging |
 
 ## Problemas comuns
@@ -171,3 +196,5 @@ python main.py
 - **Nada acontece ao abrir um jogo**: verifique a privacidade de atividade e se você não está invisível.
   Rode com `LOG_LEVEL=DEBUG` para ver se os presence updates chegam.
 - **Comandos não respondem no Telegram**: o chat precisa ser o de `TELEGRAM_CHAT_ID`.
+- **`Supabase recusou a sincronização (HTTP 404)` / `PGRST205`**: a tabela não existe; rode `supabase/schema.sql`.
+- **`Supabase recusou a sincronização (HTTP 401/403)`**: `SUPABASE_KEY` errada ou é a chave publishable/anon.

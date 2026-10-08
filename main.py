@@ -14,12 +14,14 @@ from config import (
     load_app_config,
     load_discord_config,
     load_igdb_config,
+    load_supabase_config,
     load_telegram_config,
     setup_logging,
 )
 from db import Database, Session
 from discord_presence import INTENTS_HELP, PresenceWatcher
 from igdb_client import IGDBClient
+from supabase_sync import SupabaseSync
 from telegram_bot import TelegramBot
 
 log = logging.getLogger("main")
@@ -47,14 +49,23 @@ class GameTracker:
     IGDB (que pode demorar) não bloqueie o Discord e as mensagens saiam na ordem certa.
     """
 
-    def __init__(self, db: Database, telegram: TelegramBot, igdb: IGDBClient | None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        telegram: TelegramBot,
+        igdb: IGDBClient | None,
+        sync: SupabaseSync | None = None,
+    ) -> None:
         self._db = db
         self._telegram = telegram
         self._igdb = igdb
+        self._sync = sync
         self._queue: asyncio.Queue[GameStarted | GameStopped] = asyncio.Queue()
 
     async def on_game_start(self, game: str, started_at: datetime) -> None:
         self._db.start_session(game, started_at)
+        if self._sync:
+            self._sync.notify()
         await self._queue.put(GameStarted(game, started_at))
 
     async def on_game_stop(self, game: str, ended_at: datetime) -> None:
@@ -62,6 +73,8 @@ class GameTracker:
         if session is None:
             log.warning("Fim de %r recebido, mas não havia sessão aberta no banco", game)
             return
+        if self._sync:
+            self._sync.notify()
         if session.game != game:
             log.warning("Sessão aberta era %r, mas o Discord encerrou %r", session.game, game)
         await self._queue.put(GameStopped(session))
@@ -92,6 +105,7 @@ async def run() -> None:
     discord_cfg = load_discord_config()
     telegram_cfg = load_telegram_config()
     igdb_cfg = load_igdb_config()
+    supabase_cfg = load_supabase_config()
     app_cfg = load_app_config()
 
     db = Database(app_cfg.db_path)
@@ -107,8 +121,19 @@ async def run() -> None:
     if igdb_cfg is None:
         log.warning("IGDB_CLIENT_ID/IGDB_CLIENT_SECRET não definidos: mensagens sem capa/metadados")
     igdb = IGDBClient(igdb_cfg.client_id, igdb_cfg.client_secret) if igdb_cfg else None
+    if supabase_cfg is None:
+        log.info("SUPABASE_URL/SUPABASE_KEY não definidos: sessões ficam só no SQLite local")
+        sync = None
+    else:
+        sync = SupabaseSync(
+            db,
+            supabase_cfg.url,
+            supabase_cfg.key,
+            table=supabase_cfg.table,
+            interval=supabase_cfg.sync_interval,
+        )
     telegram = TelegramBot(telegram_cfg.bot_token, telegram_cfg.chat_id, db)
-    tracker = GameTracker(db, telegram, igdb)
+    tracker = GameTracker(db, telegram, igdb, sync)
     watcher = PresenceWatcher(
         guild_id=discord_cfg.guild_id,
         user_id=discord_cfg.user_id,
@@ -124,6 +149,8 @@ async def run() -> None:
             tasks.create_task(watcher.start(discord_cfg.bot_token), name="discord")
             tasks.create_task(tracker.run_notifier(), name="notifier")
             tasks.create_task(heartbeat(db), name="heartbeat")
+            if sync:
+                tasks.create_task(sync.run(), name="supabase-sync")
     except* discord.PrivilegedIntentsRequired:
         log.critical(INTENTS_HELP)
     except* discord.LoginFailure:
@@ -137,6 +164,13 @@ async def run() -> None:
         # A sessão aberta fica aberta de propósito: ao reiniciar, é retomada ou
         # fechada no último heartbeat.
         db.touch_open_session(datetime.now(timezone.utc))
+        if sync:
+            # Última tentativa rápida; o que não for enviado fica pendente para a próxima execução.
+            try:
+                await asyncio.wait_for(sync.sync_once(), timeout=10)
+            except TimeoutError:
+                log.warning("Sincronização final com o Supabase excedeu o tempo; fica para a próxima")
+            await sync.aclose()
         db.close()
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_single_open
     ON sessions((ended_at IS NULL)) WHERE ended_at IS NULL;
 """
 
+# Colunas de sincronização com o Supabase, adicionadas também em bancos já existentes.
+#   uuid:           id global da sessão (chave primária no Supabase)
+#   version:        incrementado a cada alteração local da linha
+#   synced_version: última versão confirmada pelo Supabase (pendente se version > synced_version)
+SYNC_COLUMNS = {
+    "uuid": "TEXT",
+    "version": "INTEGER NOT NULL DEFAULT 1",
+    "synced_version": "INTEGER NOT NULL DEFAULT 0",
+}
+
 
 @dataclass(frozen=True)
 class Session:
@@ -45,6 +56,20 @@ class Session:
         if self.duration_seconds is not None:
             return self.duration_seconds
         return max(0, int((now - self.started_at).total_seconds()))
+
+
+@dataclass(frozen=True)
+class PendingSync:
+    """Linha alterada localmente que ainda não foi enviada ao Supabase."""
+
+    local_id: int
+    version: int
+    uuid: str
+    game: str
+    started_at: datetime
+    ended_at: datetime | None
+    duration_seconds: int | None
+    last_seen_at: datetime
 
 
 @dataclass(frozen=True)
@@ -78,7 +103,21 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         log.info("Banco SQLite aberto em %s", path)
+
+    def _migrate(self) -> None:
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+        with self._conn:
+            for column, definition in SYNC_COLUMNS.items():
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
+            missing = self._conn.execute("SELECT id FROM sessions WHERE uuid IS NULL").fetchall()
+            self._conn.executemany(
+                "UPDATE sessions SET uuid = ? WHERE id = ?",
+                [(str(uuid.uuid4()), row["id"]) for row in missing],
+            )
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(uuid)")
 
     def close(self) -> None:
         self._conn.close()
@@ -91,8 +130,8 @@ class Database:
             self._close_open(started_at)
             ts = _to_ts(started_at)
             cursor = self._conn.execute(
-                "INSERT INTO sessions (game, started_at, last_seen_at) VALUES (?, ?, ?)",
-                (game, ts, ts),
+                "INSERT INTO sessions (uuid, game, started_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                (str(uuid.uuid4()), game, ts, ts),
             )
         log.info("Sessão #%s aberta: %r", cursor.lastrowid, game)
         return Session(cursor.lastrowid, game, started_at, None, None)  # type: ignore[arg-type]
@@ -106,7 +145,8 @@ class Database:
         """Heartbeat: marca que a sessão aberta ainda estava ativa em `now`."""
         with self._conn:
             self._conn.execute(
-                "UPDATE sessions SET last_seen_at = ? WHERE ended_at IS NULL", (_to_ts(now),)
+                "UPDATE sessions SET last_seen_at = ?, version = version + 1 WHERE ended_at IS NULL",
+                (_to_ts(now),),
             )
 
     def close_stale_session(self, stale_before: datetime) -> Session | None:
@@ -131,7 +171,8 @@ class Database:
         end_ts = max(_to_ts(ended_at), row["started_at"])
         duration = end_ts - row["started_at"]
         self._conn.execute(
-            "UPDATE sessions SET ended_at = ?, duration_seconds = ?, last_seen_at = ? WHERE id = ?",
+            "UPDATE sessions SET ended_at = ?, duration_seconds = ?, last_seen_at = ?, "
+            "version = version + 1 WHERE id = ?",
             (end_ts, duration, end_ts, row["id"]),
         )
         log.info("Sessão #%s fechada: %r (%ss)", row["id"], row["game"], duration)
@@ -142,6 +183,35 @@ class Database:
             ended_at=_from_ts(end_ts),
             duration_seconds=duration,
         )
+
+    # --- sincronização ------------------------------------------------------
+
+    def pending_sync(self, limit: int = 200) -> list[PendingSync]:
+        rows = self._conn.execute(
+            "SELECT * FROM sessions WHERE version > synced_version ORDER BY id LIMIT ?", (limit,)
+        ).fetchall()
+        return [
+            PendingSync(
+                local_id=r["id"],
+                version=r["version"],
+                uuid=r["uuid"],
+                game=r["game"],
+                started_at=_from_ts(r["started_at"]),  # type: ignore[arg-type]
+                ended_at=_from_ts(r["ended_at"]),
+                duration_seconds=r["duration_seconds"],
+                last_seen_at=_from_ts(r["last_seen_at"]),  # type: ignore[arg-type]
+            )
+            for r in rows
+        ]
+
+    def mark_synced(self, rows: list[PendingSync]) -> None:
+        """Marca como sincronizada a versão enviada. Se a linha mudou durante o envio,
+        `version` já é maior e ela continua pendente para o próximo ciclo."""
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE sessions SET synced_version = MAX(synced_version, ?) WHERE id = ?",
+                [(r.version, r.local_id) for r in rows],
+            )
 
     # --- leitura -----------------------------------------------------------
 

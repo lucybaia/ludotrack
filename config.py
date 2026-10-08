@@ -53,6 +53,14 @@ class IGDBConfig:
 
 
 @dataclass(frozen=True)
+class SupabaseConfig:
+    url: str
+    key: str
+    table: str
+    sync_interval: float
+
+
+@dataclass(frozen=True)
 class AppConfig:
     db_path: Path
     debounce_seconds: float
@@ -84,6 +92,25 @@ def load_igdb_config() -> IGDBConfig | None:
     if not client_id or not client_secret:
         return None
     return IGDBConfig(client_id=client_id, client_secret=client_secret)
+
+
+def load_supabase_config() -> SupabaseConfig | None:
+    """Supabase é opcional: retorna None se URL/chave não estiverem definidas."""
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_KEY", "").strip()
+    if not url or not key:
+        return None
+    raw_interval = os.getenv("SUPABASE_SYNC_INTERVAL", "").strip() or "30"
+    try:
+        interval = float(raw_interval)
+    except ValueError as exc:
+        raise ConfigError(f"SUPABASE_SYNC_INTERVAL inválido: {raw_interval!r}") from exc
+    return SupabaseConfig(
+        url=url,
+        key=key,
+        table=os.getenv("SUPABASE_TABLE", "").strip() or "game_sessions",
+        sync_interval=max(5.0, interval),
+    )
 
 
 def load_app_config() -> AppConfig:
