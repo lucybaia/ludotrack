@@ -164,6 +164,25 @@ python main.py
 & "C:\caminho\para\botjogos\.venv\Scripts\python.exe" "C:\caminho\para\botjogos\main.py"
 ```
 
+## 7. Hospedar no Dokploy
+
+O projeto tem um `Dockerfile`. O bot é um *worker*: não abre porta e não precisa de domínio.
+
+1. No Dokploy: **Create Service > Application**.
+2. **Provider:** GitHub, repositório `ludotrack`, branch `main`. **Build Type:** `Dockerfile`.
+3. **Environment:** cole as mesmas variáveis do seu `.env` (não precisa de `DATABASE_PATH`,
+   o container já usa `/data/games.db`).
+4. **Advanced > Volumes/Mounts:** crie um *Volume Mount* com **Mount Path** `/data`.
+   Sem isso, o banco SQLite (cadastros e histórico) é apagado a cada deploy.
+5. **Deploy.** Nos logs deve aparecer `Bot do Telegram iniciado` e `Conectado ao Discord`.
+
+> ⚠️ Rode **uma instância só**. Se o bot estiver rodando também no seu PC, o Telegram
+> recusa uma das duas (`Conflict: terminated by other getUpdates request`) e os
+> dois Discords gravariam sessões em dobro. Pare o local antes de subir no Dokploy.
+
+Para levar o histórico que já existe no PC, copie o `games.db` para o volume `/data`
+(com o bot parado). Os horários usam `TZ=America/Sao_Paulo`; mude em **Environment** se quiser.
+
 ## Como os usuários se cadastram
 
 1. Mandam `/register` no privado do bot do Telegram e recebem um código (vale 10 min)

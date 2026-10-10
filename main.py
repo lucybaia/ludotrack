@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import signal
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -113,6 +115,13 @@ async def run() -> None:
     accounts.watcher = watcher
     accounts.notify_user = telegram.send_private
 
+    # Docker (Dokploy) para o container com SIGTERM: cancela a tarefa principal para
+    # o bloco finally fechar tudo direito. No Windows não há add_signal_handler.
+    main_task = asyncio.current_task()
+    assert main_task is not None
+    with contextlib.suppress(NotImplementedError):
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, main_task.cancel)
+
     try:
         await telegram.start()
         async with asyncio.TaskGroup() as tasks:
@@ -159,6 +168,8 @@ def main() -> None:
         raise SystemExit(1) from exc
     except KeyboardInterrupt:
         log.info("Encerrado pelo usuário.")
+    except asyncio.CancelledError:
+        log.info("Encerrado (SIGTERM).")
 
 
 if __name__ == "__main__":
