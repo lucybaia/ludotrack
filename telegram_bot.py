@@ -1,4 +1,8 @@
-"""Bot do Telegram: comandos (/nowplaying, /stats) e envio das notificações de sessão."""
+"""Bot do Telegram: cadastro (/register) e consultas (/nowplaying, /stats).
+
+Funciona no privado e em qualquer grupo: cada pessoa consulta os próprios jogos,
+e a resposta fica visível para quem estiver no chat.
+"""
 
 from __future__ import annotations
 
@@ -6,22 +10,25 @@ import logging
 from datetime import datetime, timedelta, timezone
 from html import escape
 
-from telegram import BotCommand, LinkPreviewOptions, Update
-from telegram.constants import ParseMode
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
+from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from db import Database, GameStats, Session
-from igdb_client import GameInfo
+from accounts import CODE_TTL_SECONDS, AccountService
+from db import Database, GameStats, User
+from discord_presence import LiveGame, PresenceWatcher
+from igdb_client import IGDBClient
 
 log = logging.getLogger(__name__)
 
-CAPTION_LIMIT = 1024  # limite do Telegram para legendas de foto
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 COMMANDS = [
-    BotCommand("nowplaying", "O que estou jogando agora"),
-    BotCommand("stats", "Resumo de jogos da semana/mês"),
+    BotCommand("nowplaying", "Mostra o que você está jogando agora"),
+    BotCommand("stats", "Seus jogos mais jogados na semana/mês"),
+    BotCommand("register", "Vincular sua conta do Discord"),
+    BotCommand("unregister", "Desvincular sua conta"),
     BotCommand("help", "Ajuda"),
 ]
 
@@ -49,25 +56,41 @@ def _fmt_datetime(dt: datetime) -> str:
     return _local(dt).strftime("%d/%m %H:%M")
 
 
+def _ago(dt: datetime, now: datetime) -> str:
+    delta = now - dt
+    if delta < timedelta(days=2):
+        return f"há {format_duration(int(delta.total_seconds()))}"
+    return f"em {_fmt_datetime(dt)}"
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 class TelegramBot:
-    def __init__(self, token: str, chat_id: int | str, db: Database) -> None:
-        self._chat_id = chat_id
+    def __init__(
+        self,
+        token: str,
+        db: Database,
+        accounts: AccountService,
+        igdb: IGDBClient | None,
+        watcher: PresenceWatcher,
+        *,
+        discord_invite_url: str | None = None,
+    ) -> None:
         self._db = db
+        self._accounts = accounts
+        self._igdb = igdb
+        self._watcher = watcher
+        self._invite_url = discord_invite_url
         self.app = Application.builder().token(token).build()
 
-        # Comandos só respondem no chat configurado: as stats são pessoais.
-        if isinstance(chat_id, int):
-            only_owner = filters.Chat(chat_id=chat_id)
-        else:
-            only_owner = filters.Chat(username=chat_id.lstrip("@"))
-
-        self.app.add_handler(CommandHandler(["start", "help"], self._cmd_help, filters=only_owner))
-        self.app.add_handler(CommandHandler("nowplaying", self._cmd_nowplaying, filters=only_owner))
-        self.app.add_handler(CommandHandler("stats", self._cmd_stats, filters=only_owner))
+        self.app.add_handler(CommandHandler("start", self._cmd_start))
+        self.app.add_handler(CommandHandler("help", self._cmd_help))
+        self.app.add_handler(CommandHandler("register", self._cmd_register))
+        self.app.add_handler(CommandHandler("unregister", self._cmd_unregister))
+        self.app.add_handler(CommandHandler(["nowplaying", "np"], self._cmd_nowplaying))
+        self.app.add_handler(CommandHandler("stats", self._cmd_stats))
         self.app.add_error_handler(self._on_error)
 
     # --- ciclo de vida (sem run_polling: compartilha o event loop com o Discord) ---
@@ -90,11 +113,140 @@ class TelegramBot:
             await self.app.stop()
         await self.app.shutdown()
 
-    # --- notificações ---------------------------------------------------------
+    async def send_private(self, telegram_id: int, text: str) -> None:
+        try:
+            await self.app.bot.send_message(
+                telegram_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW
+            )
+        except TelegramError as exc:
+            log.error("Falha ao enviar mensagem para telegram=%s: %s", telegram_id, exc)
 
-    async def send_game_started(self, game: str, started_at: datetime, info: GameInfo | None) -> None:
-        header = f"🎮 <b>Comecei a jogar:</b> {escape(game)}"
-        details: list[str] = []
+    # --- cadastro ---------------------------------------------------------------
+
+    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Link t.me/<bot>?start=register (enviado quando alguém tenta /register num grupo).
+        if context.args and context.args[0] == "register":
+            await self._cmd_register(update, context)
+        else:
+            await self._cmd_help(update, context)
+
+    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(
+            "🎮 <b>LudoTrack — um Last.fm de jogos</b>\n"
+            "Eu acompanho o que você joga pela sua atividade no Discord.\n\n"
+            "/register — vincular sua conta do Discord (no privado)\n"
+            "/nowplaying ou /np — mostra o que você está jogando\n"
+            "/stats — seus jogos mais jogados na semana e no mês\n"
+            "/unregister — desvincular sua conta\n\n"
+            "Os comandos funcionam aqui e em grupos: me adicione a um grupo para mostrar seus jogos lá.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_register(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if user is None:
+            return
+
+        if update.effective_chat.type != ChatType.PRIVATE:
+            url = f"https://t.me/{context.bot.username}?start=register"
+            await message.reply_text(
+                "Para se cadastrar, fale comigo no privado 👇",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cadastrar", url=url)]]),
+            )
+            return
+
+        lines = []
+        if existing := self._db.get_user_by_telegram(user.id):
+            lines.append(
+                f"Você já está vinculado a <b>{escape(existing.discord_name)}</b>. "
+                "Usar um novo código troca a conta vinculada.\n"
+            )
+
+        code = self._accounts.create_link_code(user.id)
+        bot_invite = self._watcher.invite_url
+        lines.append(f"🔗 Seu código: <code>{code}</code> (vale {CODE_TTL_SECONDS // 60} min)\n")
+        if bot_invite:
+            step1 = "Adicione o bot do Discord a um servidor seu (botão <b>Adicionar ao Discord</b> abaixo)"
+            if self._invite_url:
+                step1 += " ou entre no servidor oficial (botão <b>Entrar no servidor</b>)"
+        elif self._invite_url:
+            step1 = "Entre no servidor do Discord (botão <b>Entrar no servidor</b> abaixo)"
+        else:
+            step1 = "Esteja em um servidor do Discord em que o bot esteja"
+        steps = [step1, f"Nesse servidor, digite <code>/vincular {code}</code>"]
+        lines += [f"{i}. {step}" for i, step in enumerate(steps, start=1)]
+        lines.append(
+            "\nℹ️ Eu só enxergo seus jogos enquanto você estiver num servidor com o bot e com "
+            "<i>Configurações > Privacidade de atividade > Compartilhar atividade</i> ligado."
+        )
+
+        buttons = []
+        if bot_invite:
+            buttons.append([InlineKeyboardButton("➕ Adicionar ao Discord", url=bot_invite)])
+        if self._invite_url:
+            buttons.append([InlineKeyboardButton("🎮 Entrar no servidor", url=self._invite_url)])
+        await message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            link_preview_options=NO_PREVIEW,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        )
+
+    async def _cmd_unregister(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user is None:
+            return
+        if self._accounts.unregister(update.effective_user.id):
+            text = "👋 Conta desvinculada. Não acompanho mais seus jogos."
+        else:
+            text = "Você não tem conta vinculada."
+        await update.effective_message.reply_text(text)
+
+    async def _require_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> User | None:
+        if update.effective_user is None:
+            return None
+        user = self._db.get_user_by_telegram(update.effective_user.id)
+        if user is None:
+            url = f"https://t.me/{context.bot.username}?start=register"
+            await update.effective_message.reply_text(
+                "Você ainda não vinculou seu Discord.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cadastrar", url=url)]]),
+            )
+        return user
+
+    # --- consultas --------------------------------------------------------------
+
+    async def _cmd_nowplaying(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._require_user(update, context)
+        if user is None:
+            return
+        message = update.effective_message
+        name = escape(update.effective_user.first_name)
+        now = _now()
+
+        # A presence ao vivo responde na hora e traz os detalhes do Rich Presence.
+        live = self._watcher.live_game(user.discord_id)
+        session = self._db.get_open_session(user.discord_id)
+        if live is None and session is None:
+            text = f"😴 <b>{name}</b> não está jogando nada agora."
+            if last := self._db.get_last_finished_session(user.discord_id):
+                assert last.ended_at is not None
+                text += f"\nÚltimo jogo: <b>{escape(last.game)}</b> ({_ago(last.ended_at, now)})"
+            await message.reply_text(text, parse_mode=ParseMode.HTML)
+            return
+
+        game = live.name if live else session.game  # type: ignore[union-attr]
+        started_at = session.started_at if session and session.game == game else None
+        if started_at is None and live:
+            started_at = live.started_at
+
+        info = await self._igdb.search_game(game) if self._igdb else None
+        lines = [f"🎮 <b>{name}</b> está jogando <b>{escape(game)}</b>"]
+        if live:
+            lines += self._live_lines(live)
+        if started_at:
+            elapsed = int((now - started_at).total_seconds())
+            lines.append(f"⏱ há {format_duration(elapsed)} (desde {_fmt_time(started_at)})")
         if info:
             meta = []
             if info.release_year:
@@ -104,107 +256,71 @@ class TelegramBot:
             if info.rating:
                 meta.append(f"⭐ {info.rating:.0f}/100")
             if meta:
-                details.append(" · ".join(meta))
-            if info.url:
-                details.append(f'<a href="{escape(info.url, quote=True)}">Ver no IGDB</a>')
-        details.append(f"🕒 {_fmt_time(started_at)}")
+                lines.append(" · ".join(meta))
+        week = self._db.totals(user.discord_id, now, since=now - timedelta(days=7), game=game)
+        if week.total_seconds:
+            lines.append(f"📈 {format_duration(week.total_seconds)} nesse jogo nos últimos 7 dias")
+        if info and info.url:
+            lines.append(f'<a href="{escape(info.url, quote=True)}">Ver no IGDB</a>')
+        text = "\n".join(lines)
 
-        summary = info.summary if info else None
-        text = self._compose(header, details, summary, limit=CAPTION_LIMIT if info and info.cover_url else 4096)
-
-        if info and info.cover_url:
+        # Capa: arte da IGDB; sem ela, a imagem que o próprio jogo publica no Rich Presence.
+        covers = [url for url in (info.cover_url if info else None, live.image_url if live else None) if url]
+        for cover in dict.fromkeys(covers):
             try:
-                await self.app.bot.send_photo(
-                    self._chat_id, photo=info.cover_url, caption=text, parse_mode=ParseMode.HTML
-                )
+                await message.reply_photo(cover, caption=text, parse_mode=ParseMode.HTML)
                 return
             except TelegramError as exc:
-                log.warning("Falha ao enviar capa (%s); enviando só texto", exc)
-        await self._send_text(text)
-
-    async def send_game_stopped(self, session: Session) -> None:
-        assert session.ended_at is not None and session.duration_seconds is not None
-        week = self._db.totals(_now(), since=_now() - timedelta(days=7), game=session.game)
-        lines = [
-            f"⏹ <b>Parei de jogar:</b> {escape(session.game)}",
-            f"⏱ Sessão: <b>{format_duration(session.duration_seconds)}</b> "
-            f"({_fmt_time(session.started_at)} → {_fmt_time(session.ended_at)})",
-            f"📈 Últimos 7 dias nesse jogo: {format_duration(week.total_seconds)} "
-            f"em {week.sessions} sessão(ões)",
-        ]
-        await self._send_text("\n".join(lines))
+                log.warning("Falha ao enviar imagem %s (%s)", cover, exc)
+        await message.reply_text(text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW)
 
     @staticmethod
-    def _compose(header: str, details: list[str], summary: str | None, *, limit: int) -> str:
-        base = "\n".join([header, *details])
-        if not summary:
-            return base
-        room = limit - len(base) - len("\n\n<i></i>") - 1
-        if room < 40:
-            return base
-        snippet = summary if len(summary) <= room else summary[: room - 1].rstrip() + "…"
-        # escape() pode aumentar o tamanho; corta de novo se necessário.
-        escaped = escape(snippet)
-        while len(escaped) > room and snippet:
-            snippet = snippet[:-20].rstrip() + "…"
-            escaped = escape(snippet)
-        return f"{base}\n\n<i>{escaped}</i>"
+    def _live_lines(live: LiveGame) -> list[str]:
+        """Detalhes do Rich Presence: modo, mapa, placar/KDA, personagem, elo, grupo...
 
-    async def _send_text(self, text: str) -> None:
-        try:
-            await self.app.bot.send_message(
-                self._chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW
-            )
-        except TelegramError as exc:
-            log.error("Falha ao enviar mensagem para o Telegram: %s", exc)
-
-    # --- comandos ---------------------------------------------------------------
-
-    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_message.reply_text(
-            "🎮 <b>Last.fm de jogos</b>\n"
-            "Eu acompanho o que você joga pela presence do Discord.\n\n"
-            "/nowplaying — o que está rodando agora\n"
-            "/stats — jogos mais jogados na semana e no mês",
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _cmd_nowplaying(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        session = self._db.get_open_session()
-        if session is None:
-            text = "😴 Offline / sem jogo no momento."
-            last = self._db.get_last_finished_session()
-            if last and last.ended_at:
-                text += f"\nÚltimo: <b>{escape(last.game)}</b> em {_fmt_datetime(last.ended_at)}"
-        else:
-            text = (
-                f"🎮 Jogando agora: <b>{escape(session.game)}</b>\n"
-                f"⏱ Há {format_duration(session.elapsed_seconds(_now()))} "
-                f"(desde {_fmt_time(session.started_at)})"
-            )
-        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+        Cada jogo decide o que publica; mostramos o que vier, sem repetir textos.
+        """
+        lines = []
+        seen = {live.name.casefold()}
+        for icon, value in (
+            ("🕹", live.details),
+            ("📍", live.state),
+            ("🧙", live.large_text),
+            ("🏅", live.small_text),
+        ):
+            if value and value.casefold() not in seen:
+                seen.add(value.casefold())
+                lines.append(f"{icon} {escape(value)}")
+        if live.party and live.party[1]:
+            lines.append(f"👥 Grupo {live.party[0]}/{live.party[1]}")
+        return lines
 
     async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._require_user(update, context)
+        if user is None:
+            return
+        uid = user.discord_id
         now = _now()
-        parts = ["📊 <b>Scrobbles de jogos</b>"]
+        parts = [f"📊 <b>Scrobbles de {escape(update.effective_user.first_name)}</b>"]
         for label, days in (("Últimos 7 dias", 7), ("Últimos 30 dias", 30)):
             since = now - timedelta(days=days)
-            parts.append(self._period_block(label, self._db.totals(now, since), self._db.top_games(now, since)))
+            parts.append(
+                self._period_block(label, self._db.totals(uid, now, since), self._db.top_games(uid, now, since))
+            )
 
-        all_time = self._db.totals(now)
+        all_time = self._db.totals(uid, now)
         parts.append(
             f"<b>Total geral:</b> {format_duration(all_time.total_seconds)} "
             f"em {all_time.sessions} sessão(ões)"
         )
 
         footer = []
-        if last := self._db.get_last_finished_session():
-            assert last.ended_at is not None
+        if last := self._db.get_last_finished_session(uid):
             footer.append(
                 f"<b>Última sessão:</b> {escape(last.game)} — "
                 f"{format_duration(last.elapsed_seconds(now))} ({_fmt_datetime(last.started_at)})"
             )
-        if current := self._db.get_open_session():
+        if current := self._db.get_open_session(uid):
             footer.append(
                 f"🎮 <b>Agora:</b> {escape(current.game)} "
                 f"(há {format_duration(current.elapsed_seconds(now))})"

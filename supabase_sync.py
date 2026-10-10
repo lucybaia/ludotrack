@@ -31,6 +31,7 @@ def _iso(value: datetime | None) -> str | None:
 def _payload(row: PendingSync, synced_at: str) -> dict[str, Any]:
     return {
         "id": row.uuid,
+        "discord_user_id": row.discord_id,
         "game": row.game,
         "started_at": _iso(row.started_at),
         "ended_at": _iso(row.ended_at),

@@ -1,9 +1,11 @@
-# botjogos — um "Last.fm para jogos"
+# LudoTrack — um "Last.fm para jogos"
 
-Bot que acompanha o que você está jogando pela **presence do Discord** e posta no
-**Telegram**: avisa quando você começa um jogo (com capa, gênero e ano via IGDB),
-avisa quando para (com a duração da sessão) e guarda tudo num SQLite local para
-os comandos `/stats` e `/nowplaying`.
+Bot de Telegram que mostra o que você está jogando, a partir da sua **atividade no
+Discord**. Qualquer pessoa pode se cadastrar (adicionando o bot do Discord ao próprio
+servidor) e usar `/nowplaying` no privado ou num grupo para mostrar aos amigos o jogo
+atual — na hora, com capa e os detalhes que o jogo publica no Discord (modo, mapa,
+placar/KDA, personagem, elo, grupo) — e `/stats` para ver os jogos mais jogados da
+semana e do mês.
 
 Funciona com qualquer jogo que o Discord detecte sozinho (League of Legends,
 Valorant, TFT, jogos da Steam/Epic etc.), sem API específica por jogo.
@@ -12,18 +14,30 @@ Valorant, TFT, jogos da Steam/Epic etc.), sem API específica por jogo.
 
 ```
 Discord (presence) ──► discord_presence.py ──► main.py (GameTracker) ──► db.py (SQLite) ──► supabase_sync.py ──► Supabase
-                         debounce de 15s              │                                     (background, opcional)
-                                                      └─► fila ──► igdb_client.py ──► telegram_bot.py
+   /vincular ─────────► accounts.py ◄────────── telegram_bot.py (/register)        ▲         (background, opcional)
+                                                telegram_bot.py (/nowplaying, /stats) ──┘ + igdb_client.py
 ```
 
-- Um bot do Discord fica num servidor onde **você também está** e escuta
-  `on_presence_update` só do seu user ID.
+- O bot do Discord pode estar em **qualquer número de servidores**: cada pessoa o
+  adiciona ao próprio servidor pelo botão **Adicionar ao Discord** do `/register`.
+  Ele escuta `on_presence_update` de quem se cadastrou, em qualquer servidor em comum.
+- **Cadastro sem senha:** `/register` no Telegram gera um código; a pessoa digita
+  `/vincular CÓDIGO` num servidor com o bot. Só o dono da conta do Discord consegue
+  fazer isso, então o vínculo é seguro sem pedir token ou senha.
 - Só activities do tipo `playing` contam (Spotify, status personalizado etc. são ignorados).
-- **Debounce:** uma mudança (abrir, trocar ou fechar jogo) só vale se durar ≥ 15s.
-  Oscilações no início do jogo não viram sessões falsas, e o horário registrado é o
-  do início real da mudança.
+- **Detecção imediata:** abrir ou trocar de jogo vale na hora, e o `/nowplaying` lê a
+  presence ao vivo. Só o **fechamento** tem tolerância de 15s: se o jogo sumir e voltar
+  nesse intervalo (oscilação da presence), a sessão continua; se não voltar, ela termina
+  no momento em que o jogo sumiu.
+- **Capa e detalhes:** a capa vem da IGDB; sem ela, usa a imagem do Rich Presence do jogo.
+  Os detalhes extras (modo, mapa, placar, KDA, farm, personagem, elo, tamanho do grupo)
+  são os que **o próprio jogo publica no Discord** — cada jogo mostra coisas diferentes,
+  e muitos não publicam nada além do nome. O League of Legends, por exemplo, publica
+  modo/mapa e campeão, mas não KDA nem farm.
+- O bot **não manda avisos automáticos**: cada pessoa decide quando mostrar o que está
+  jogando, com `/nowplaying`.
 - Discord e Telegram rodam no **mesmo event loop asyncio** (`asyncio.TaskGroup`).
-- Falhas na IGDB só geram log; a mensagem sai sem capa.
+- Falhas na IGDB só geram log; a resposta sai sem capa.
 - Se o processo cair no meio de um jogo, a sessão é fechada no último *heartbeat*
   (gravado a cada 60s) ao reiniciar. Se reiniciar em menos de 5 min, a sessão é retomada.
 
@@ -53,58 +67,51 @@ notepad .env
 2. No menu lateral, abra **Bot**:
    - Clique em **Reset Token** e copie o token para `DISCORD_BOT_TOKEN` no `.env`.
    - Em **Privileged Gateway Intents**, ligue:
-     - ✅ **PRESENCE INTENT** (obrigatório: é o que permite ver o que você está jogando)
-     - ✅ **SERVER MEMBERS INTENT** (para o bot encontrar você na lista de membros)
+     - ✅ **PRESENCE INTENT** (obrigatório: é o que permite ver o que as pessoas estão jogando)
+     - ✅ **SERVER MEMBERS INTENT** (para o bot encontrar os usuários na lista de membros)
    - Clique em **Save Changes**.
 
    Sem esses intents o bot para com o erro `PrivilegedIntentsRequired`.
-3. Em **OAuth2 > URL Generator**, marque o scope **bot** (nenhuma permissão é
-   necessária), copie a URL gerada, abra no navegador e adicione o bot ao seu servidor.
+3. Ainda em **Bot**, deixe **Public Bot** ligado, para qualquer pessoa poder adicioná-lo
+   ao próprio servidor.
 
-### O bot precisa estar num servidor em comum com você
+### Os servidores do Discord
 
-O Discord só envia a presence de quem compartilha um servidor com o bot. O mais simples:
+O Discord só envia a presence de quem compartilha um servidor com o bot. Não é preciso
+configurar servidor nenhum: ao rodar, o bot loga `Link para adicionar o bot a um servidor: ...`,
+e o mesmo link aparece no botão **Adicionar ao Discord** do `/register`. Cada pessoa
+adiciona o bot a um servidor seu (pode ser um servidor vazio, criado só para isso) e
+usa `/vincular` lá. O link já pede os scopes `bot` e `applications.commands`, sem permissões.
 
-1. No Discord, clique em **+** (Adicionar servidor) > **Criar o meu** e crie um servidor
-   privado só para isso.
-2. Adicione o bot a ele pela URL do passo 3 acima.
+(Opcional) Se quiser um servidor "oficial" para quem não tem servidor próprio, crie um
+convite sem expiração e coloque em `DISCORD_INVITE_URL`: ele vira o botão **Entrar no servidor**.
 
-### Pegar os IDs
+Até 100 servidores o bot não precisa de verificação do Discord para usar o Presence Intent;
+acima disso o Discord exige verificar o bot e justificar o uso do intent.
 
-1. No Discord: **Configurações > Avançado > Modo desenvolvedor** (ligar).
-2. Botão direito no servidor > **Copiar ID do servidor** → `DISCORD_GUILD_ID`.
-3. Botão direito no seu nome > **Copiar ID do usuário** → `DISCORD_USER_ID`.
+### A atividade precisa estar visível
 
-### Sua atividade precisa estar visível
-
-Em **Configurações > Privacidade de atividade**, deixe ligado
-**"Compartilhar sua atividade detectada com outras pessoas"**. Se você estiver
-*invisível*, o Discord não envia sua atividade para ninguém, nem para o bot.
+Cada usuário precisa deixar ligado **Configurações > Privacidade de atividade >
+"Compartilhar sua atividade detectada com outras pessoas"**. Quem estiver
+*invisível* não tem a atividade enviada para ninguém, nem para o bot.
 
 ### Testar só o Discord
 
-Antes de configurar o resto, dá para rodar só a detecção (só precisa das 3 variáveis do Discord):
+Dá para rodar só a detecção, passando os IDs de usuário a acompanhar
+(botão direito no nome > **Copiar ID do usuário**):
 
 ```powershell
-python discord_presence.py
+python discord_presence.py 123456789012345678
 ```
 
-Abra um jogo e veja os logs `Possível mudança ...` e, após 15s, `SESSÃO INICIADA`.
+Abra um jogo e veja o log `SESSÃO INICIADA` na hora; feche e, após 15s, `SESSÃO ENCERRADA`.
 Para ver cada presence update cru, use `$env:LOG_LEVEL = "DEBUG"` antes de rodar.
 
 ## 3. Criar o bot no Telegram
 
-1. Fale com o [@BotFather](https://t.me/BotFather), envie `/newbot` e copie o token
-   para `TELEGRAM_BOT_TOKEN`.
-2. Descubra seu chat ID: mande qualquer mensagem para o seu bot e abra no navegador
-   `https://api.telegram.org/bot<SEU_TOKEN>/getUpdates`; o número em
-   `"chat":{"id": ...}` vai em `TELEGRAM_CHAT_ID`.
-   - Para postar num **grupo**, adicione o bot ao grupo e use o ID do grupo (negativo).
-   - Para um **canal**, adicione o bot como admin e use `@nome_do_canal`.
-
-Os comandos `/stats` e `/nowplaying` só respondem no chat de `TELEGRAM_CHAT_ID`
-(as estatísticas são pessoais). Canais não recebem comandos, então se você postar
-num canal os comandos não ficam disponíveis.
+Fale com o [@BotFather](https://t.me/BotFather), envie `/newbot` e copie o token para
+`TELEGRAM_BOT_TOKEN`. Não precisa configurar chat: o bot responde no privado e em
+qualquer grupo em que for adicionado.
 
 ## 4. IGDB (opcional, para capa/gênero/ano)
 
@@ -128,22 +135,21 @@ O SQLite local continua sendo a fonte da verdade: `/stats` e `/nowplaying` leem 
 e o bot funciona normalmente sem internet ou sem Supabase. Um worker em background
 envia ao Supabase as sessões novas/alteradas (logo após início/fim de sessão e a cada
 30s). Se o envio falhar, as linhas ficam pendentes e vão na próxima tentativa
-(com espera crescente até 5 min). Sessões gravadas antes de configurar o Supabase
-também são enviadas.
+(com espera crescente até 5 min).
 
 1. Crie um projeto em <https://supabase.com/dashboard>.
 2. Abra **SQL Editor > New query**, cole o conteúdo de [`supabase/schema.sql`](supabase/schema.sql)
-   e clique em **Run**. Isso cria a tabela `game_sessions` com RLS ligado e sem
-   policies (só a chave secreta acessa).
-3. Em **Project Settings > API** (ou **API Keys**), copie:
-   - **Project URL** → `SUPABASE_URL`
-   - a chave **secret** (`sb_secret_...`) ou a legada **service_role** → `SUPABASE_KEY`
+   e clique em **Run**. Isso cria (ou atualiza) a tabela `game_sessions` com RLS ligado
+   e sem policies (só a chave secreta acessa). Pode rodar de novo com segurança.
+3. Em **Project Settings > Data API**, copie a **Project URL** → `SUPABASE_URL`.
+4. Em **Project Settings > API Keys**, copie a chave **secret** (`sb_secret_...`) ou a
+   legada **service_role** → `SUPABASE_KEY`.
 
    Não use a chave publishable/anon: com RLS ligado ela não consegue gravar.
    A chave secreta ignora RLS, então mantenha-a só no `.env`.
 
-Enquanto você joga, a linha da sessão aberta tem `ended_at = null` e `last_seen_at`
-atualizado a cada ~1 min, então dá para montar um "jogando agora" em cima do Supabase.
+Cada linha tem `discord_user_id` (dono da sessão). Enquanto alguém joga, a linha da
+sessão aberta tem `ended_at = null` e `last_seen_at` atualizado a cada ~1 min.
 
 ## 6. Rodar
 
@@ -158,20 +164,40 @@ python main.py
 & "C:\caminho\para\botjogos\.venv\Scripts\python.exe" "C:\caminho\para\botjogos\main.py"
 ```
 
+## Como os usuários se cadastram
+
+1. Mandam `/register` no privado do bot do Telegram e recebem um código (vale 10 min)
+   e o botão **Adicionar ao Discord**. Se mandarem `/register` num grupo, o bot responde
+   com um botão que abre o privado.
+2. Pelo botão, adicionam o bot do Discord a um servidor seu (ou entram no servidor oficial,
+   se `DISCORD_INVITE_URL` estiver configurado).
+3. Nesse servidor, digitam `/vincular CÓDIGO`.
+4. Pronto: `/nowplaying` e `/stats` passam a funcionar no privado e nos grupos.
+
+Usar `/register` de novo e vincular outra conta do Discord troca o vínculo.
+`/unregister` desvincula; o histórico de sessões fica guardado e volta se a mesma
+conta do Discord for vinculada de novo.
+
 ## Comandos do Telegram
 
-| Comando       | O que faz |
-|---------------|-----------|
-| `/nowplaying` | Jogo atual e há quanto tempo, ou "offline/sem jogo" |
-| `/stats`      | Top jogos dos últimos 7 e 30 dias, tempo total, última sessão |
-| `/help`       | Ajuda |
+| Comando               | Onde           | O que faz |
+|-----------------------|----------------|-----------|
+| `/register`           | privado        | Gera o código para vincular o Discord |
+| `/nowplaying` ou `/np`| privado/grupos | Seu jogo atual (ao vivo), com capa, detalhes do Rich Presence e há quanto tempo; ou "não está jogando" + último jogo |
+| `/stats`              | privado/grupos | Seus top jogos dos últimos 7 e 30 dias, tempo total, última sessão |
+| `/unregister`         | privado/grupos | Desvincula sua conta |
+| `/help`               | privado/grupos | Ajuda |
+
+Em grupos com mais de um bot, use `/nowplaying@nome_do_bot`.
 
 ## Variáveis opcionais (`.env`)
 
 | Variável             | Padrão     | Descrição |
 |----------------------|------------|-----------|
+| `DISCORD_INVITE_URL` | (vazio)    | Convite de um servidor "oficial", vira o botão **Entrar no servidor** do `/register` |
+| `DISCORD_GUILD_ID`   | (vazio)    | Só para quem vem da versão de um servidor só: remove o `/vincular` antigo duplicado nesse servidor |
 | `DATABASE_PATH`      | `games.db` | Caminho do SQLite (relativo à pasta do projeto) |
-| `DEBOUNCE_SECONDS`   | `15`       | Quanto tempo uma mudança precisa durar para valer |
+| `DEBOUNCE_SECONDS`   | `15`       | Tolerância ao fechar um jogo (abrir/trocar vale na hora) |
 | `IGNORED_ACTIVITIES` | (vazio)    | Nomes de activities `playing` a ignorar, separados por vírgula. Útil para apps com Rich Presence que não são jogos, ex.: `Visual Studio Code` |
 | `LOG_LEVEL`          | `INFO`     | `DEBUG` mostra cada presence update recebido |
 
@@ -179,11 +205,12 @@ python main.py
 
 | Arquivo               | Responsabilidade |
 |-----------------------|------------------|
-| `main.py`             | Entrypoint; liga Discord + Telegram no mesmo loop, grava sessões, fila de notificações, heartbeat |
-| `discord_presence.py` | Client do Discord, filtro por `ActivityType.playing`, debounce, detecção de início/fim |
+| `main.py`             | Entrypoint; liga Discord + Telegram no mesmo loop, grava sessões, heartbeat |
+| `discord_presence.py` | Client do Discord (multi-servidor), `/vincular`, filtro por `ActivityType.playing`, tolerância ao fechar, Rich Presence ao vivo |
+| `accounts.py`         | Códigos de vinculação e cadastro/remoção de usuários |
+| `telegram_bot.py`     | Comandos do Telegram e formatação das respostas |
 | `igdb_client.py`      | Busca na IGDB com token Twitch em cache (renova sozinho) e cache de resultados |
-| `telegram_bot.py`     | Comandos e formatação/envio das mensagens |
-| `db.py`               | SQLite: tabela `sessions`, queries de estatística e controle do que falta sincronizar |
+| `db.py`               | SQLite: tabelas `users` e `sessions`, estatísticas, controle do que falta sincronizar |
 | `supabase_sync.py`    | Envia as sessões pendentes ao Supabase (upsert via REST), com novas tentativas |
 | `supabase/schema.sql` | Tabela `game_sessions` para rodar no SQL Editor do Supabase |
 | `config.py`           | Leitura do `.env` e configuração de logging |
@@ -191,10 +218,14 @@ python main.py
 ## Problemas comuns
 
 - **`PrivilegedIntentsRequired`**: ligue PRESENCE INTENT e SERVER MEMBERS INTENT no Developer Portal (passo 2).
-- **"O bot não está no servidor"**: confira `DISCORD_GUILD_ID` e se o bot foi convidado.
-- **"Usuário ... não encontrado no servidor"**: confira `DISCORD_USER_ID` e se você está no servidor.
-- **Nada acontece ao abrir um jogo**: verifique a privacidade de atividade e se você não está invisível.
+- **`/vincular` não aparece no Discord**: adicione o bot de novo pelo link do `/register`
+  (ele inclui `applications.commands`) e reinicie o app do Discord (Ctrl+R).
+- **"user=... não está em nenhum servidor do bot"**: a pessoa vinculada saiu do servidor
+  (ou removeu o bot de lá).
+- **O botão "Adicionar ao Discord" não aparece**: o bot do Discord ainda não conectou; tente de novo em instantes.
+- **`/nowplaying` diz que não estou jogando**: verifique a privacidade de atividade e se você não
+  está invisível.
   Rode com `LOG_LEVEL=DEBUG` para ver se os presence updates chegam.
-- **Comandos não respondem no Telegram**: o chat precisa ser o de `TELEGRAM_CHAT_ID`.
 - **`Supabase recusou a sincronização (HTTP 404)` / `PGRST205`**: a tabela não existe; rode `supabase/schema.sql`.
+- **`Supabase recusou ... PGRST204` (coluna não encontrada)**: a tabela é de uma versão antiga; rode `supabase/schema.sql` de novo.
 - **`Supabase recusou a sincronização (HTTP 401/403)`**: `SUPABASE_KEY` errada ou é a chave publishable/anon.

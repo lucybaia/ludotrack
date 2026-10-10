@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 import discord
 
+from accounts import AccountService
 from config import (
     ConfigError,
     load_app_config,
@@ -18,7 +19,7 @@ from config import (
     load_telegram_config,
     setup_logging,
 )
-from db import Database, Session
+from db import Database
 from discord_presence import INTENTS_HELP, PresenceWatcher
 from igdb_client import IGDBClient
 from supabase_sync import SupabaseSync
@@ -31,74 +32,35 @@ HEARTBEAT_INTERVAL = 60  # segundos
 STALE_SESSION_AFTER = timedelta(minutes=5)
 
 
-@dataclass(frozen=True)
-class GameStarted:
-    game: str
-    started_at: datetime
-
-
-@dataclass(frozen=True)
-class GameStopped:
-    session: Session
-
-
 class GameTracker:
-    """Recebe as transições do PresenceWatcher, grava no banco e enfileira notificações.
+    """Recebe as transições confirmadas do PresenceWatcher e grava as sessões no banco."""
 
-    As notificações passam por uma fila com um único consumidor para que a busca na
-    IGDB (que pode demorar) não bloqueie o Discord e as mensagens saiam na ordem certa.
-    """
-
-    def __init__(
-        self,
-        db: Database,
-        telegram: TelegramBot,
-        igdb: IGDBClient | None,
-        sync: SupabaseSync | None = None,
-    ) -> None:
+    def __init__(self, db: Database, on_change: Callable[[], None] | None = None) -> None:
         self._db = db
-        self._telegram = telegram
-        self._igdb = igdb
-        self._sync = sync
-        self._queue: asyncio.Queue[GameStarted | GameStopped] = asyncio.Queue()
+        self._on_change = on_change
 
-    async def on_game_start(self, game: str, started_at: datetime) -> None:
-        self._db.start_session(game, started_at)
-        if self._sync:
-            self._sync.notify()
-        await self._queue.put(GameStarted(game, started_at))
+    async def on_game_start(self, discord_id: int, game: str, started_at: datetime) -> None:
+        self._db.start_session(discord_id, game, started_at)
+        self._changed()
 
-    async def on_game_stop(self, game: str, ended_at: datetime) -> None:
-        session = self._db.end_open_session(ended_at)
+    async def on_game_stop(self, discord_id: int, game: str, ended_at: datetime) -> None:
+        session = self._db.end_open_session(discord_id, ended_at)
         if session is None:
-            log.warning("Fim de %r recebido, mas não havia sessão aberta no banco", game)
+            log.warning("Fim de %r (user=%s) recebido, mas não havia sessão aberta", game, discord_id)
             return
-        if self._sync:
-            self._sync.notify()
         if session.game != game:
-            log.warning("Sessão aberta era %r, mas o Discord encerrou %r", session.game, game)
-        await self._queue.put(GameStopped(session))
+            log.warning("user=%s: sessão aberta era %r, mas o Discord encerrou %r", discord_id, session.game, game)
+        self._changed()
 
-    async def run_notifier(self) -> None:
-        while True:
-            event = await self._queue.get()
-            try:
-                match event:
-                    case GameStarted(game, started_at):
-                        info = await self._igdb.search_game(game) if self._igdb else None
-                        await self._telegram.send_game_started(game, started_at, info)
-                    case GameStopped(session):
-                        await self._telegram.send_game_stopped(session)
-            except Exception:
-                log.exception("Erro ao notificar evento %s", event)
-            finally:
-                self._queue.task_done()
+    def _changed(self) -> None:
+        if self._on_change:
+            self._on_change()
 
 
 async def heartbeat(db: Database) -> None:
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
-        db.touch_open_session(datetime.now(timezone.utc))
+        db.touch_open_sessions(datetime.now(timezone.utc))
 
 
 async def run() -> None:
@@ -110,17 +72,18 @@ async def run() -> None:
 
     db = Database(app_cfg.db_path)
 
-    # Recuperação após crash/desligamento: fecha sessão "esquecida" no último heartbeat.
+    # Recuperação após crash/desligamento: fecha sessões "esquecidas" no último heartbeat,
+    # e sessões abertas de quem não está mais vinculado.
     now = datetime.now(timezone.utc)
-    if stale := db.close_stale_session(now - STALE_SESSION_AFTER):
-        log.info("Sessão antiga de %r fechada no último heartbeat (%s)", stale.game, stale.ended_at)
-    open_session = db.get_open_session()
-    if open_session:
-        log.info("Retomando sessão em andamento: %r", open_session.game)
+    linked = db.linked_discord_ids()
+    for session in db.close_stale_sessions(now - STALE_SESSION_AFTER) + db.close_sessions_except(linked):
+        log.info("Sessão antiga de %r (user=%s) fechada em %s", session.game, session.discord_id, session.ended_at)
+    open_games = {s.discord_id: s.game for s in db.get_open_sessions()}
 
     if igdb_cfg is None:
-        log.warning("IGDB_CLIENT_ID/IGDB_CLIENT_SECRET não definidos: mensagens sem capa/metadados")
+        log.warning("IGDB_CLIENT_ID/IGDB_CLIENT_SECRET não definidos: /nowplaying sem capa/metadados")
     igdb = IGDBClient(igdb_cfg.client_id, igdb_cfg.client_secret) if igdb_cfg else None
+
     if supabase_cfg is None:
         log.info("SUPABASE_URL/SUPABASE_KEY não definidos: sessões ficam só no SQLite local")
         sync = None
@@ -132,22 +95,28 @@ async def run() -> None:
             table=supabase_cfg.table,
             interval=supabase_cfg.sync_interval,
         )
-    telegram = TelegramBot(telegram_cfg.bot_token, telegram_cfg.chat_id, db)
-    tracker = GameTracker(db, telegram, igdb, sync)
+    on_change = sync.notify if sync else None
+
+    accounts = AccountService(db, on_change=on_change)
     watcher = PresenceWatcher(
-        guild_id=discord_cfg.guild_id,
-        user_id=discord_cfg.user_id,
-        listener=tracker,
-        debounce_seconds=app_cfg.debounce_seconds,
+        listener=GameTracker(db, on_change),
+        link_handler=accounts.complete_link,
+        stop_grace_seconds=app_cfg.debounce_seconds,
         ignored_activities=app_cfg.ignored_activities,
-        initial_game=open_session.game if open_session else None,
+        legacy_guild_id=discord_cfg.legacy_guild_id,
     )
+    for discord_id in linked:
+        watcher.track(discord_id, current_game=open_games.get(discord_id))
+    telegram = TelegramBot(
+        telegram_cfg.bot_token, db, accounts, igdb, watcher, discord_invite_url=discord_cfg.invite_url
+    )
+    accounts.watcher = watcher
+    accounts.notify_user = telegram.send_private
 
     try:
         await telegram.start()
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(watcher.start(discord_cfg.bot_token), name="discord")
-            tasks.create_task(tracker.run_notifier(), name="notifier")
             tasks.create_task(heartbeat(db), name="heartbeat")
             if sync:
                 tasks.create_task(sync.run(), name="supabase-sync")
@@ -161,9 +130,9 @@ async def run() -> None:
         await telegram.stop()
         if igdb:
             await igdb.aclose()
-        # A sessão aberta fica aberta de propósito: ao reiniciar, é retomada ou
-        # fechada no último heartbeat.
-        db.touch_open_session(datetime.now(timezone.utc))
+        # Sessões abertas ficam abertas de propósito: ao reiniciar, são retomadas ou
+        # fechadas no último heartbeat.
+        db.touch_open_sessions(datetime.now(timezone.utc))
         if sync:
             # Última tentativa rápida; o que não for enviado fica pendente para a próxima execução.
             try:

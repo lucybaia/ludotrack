@@ -25,8 +25,10 @@ def _require(name: str) -> str:
     return value
 
 
-def _require_int(name: str) -> int:
-    value = _require(name)
+def _optional_int(name: str) -> int | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
     try:
         return int(value)
     except ValueError as exc:
@@ -36,14 +38,15 @@ def _require_int(name: str) -> int:
 @dataclass(frozen=True)
 class DiscordConfig:
     bot_token: str
-    guild_id: int
-    user_id: int
+    # Opcional, de versões antigas (um servidor só): o /vincular registrado nesse servidor é removido,
+    # já que agora o comando é global.
+    legacy_guild_id: int | None
+    invite_url: str | None  # convite de um servidor "oficial", mostrado no /register
 
 
 @dataclass(frozen=True)
 class TelegramConfig:
     bot_token: str
-    chat_id: int | str  # int para chats/grupos, "@canal" para canais públicos
 
 
 @dataclass(frozen=True)
@@ -71,18 +74,13 @@ class AppConfig:
 def load_discord_config() -> DiscordConfig:
     return DiscordConfig(
         bot_token=_require("DISCORD_BOT_TOKEN"),
-        guild_id=_require_int("DISCORD_GUILD_ID"),
-        user_id=_require_int("DISCORD_USER_ID"),
+        legacy_guild_id=_optional_int("DISCORD_GUILD_ID"),
+        invite_url=os.getenv("DISCORD_INVITE_URL", "").strip() or None,
     )
 
 
 def load_telegram_config() -> TelegramConfig:
-    raw_chat = _require("TELEGRAM_CHAT_ID")
-    try:
-        chat_id: int | str = int(raw_chat)
-    except ValueError:
-        chat_id = raw_chat if raw_chat.startswith("@") else f"@{raw_chat}"
-    return TelegramConfig(bot_token=_require("TELEGRAM_BOT_TOKEN"), chat_id=chat_id)
+    return TelegramConfig(bot_token=_require("TELEGRAM_BOT_TOKEN"))
 
 
 def load_igdb_config() -> IGDBConfig | None:
